@@ -2,19 +2,23 @@ import os
 import json
 import logging
 import datetime as dt
+import random
+import time
 from typing import Any, Dict, List
-import requests
 
+import requests
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
-# --- CONFIG FROM ENV ---------------------------------------------------------
+# ---------------------------------------------------------------------
+# CONFIG FROM ENV
+# ---------------------------------------------------------------------
 
 GOOGLE_SERVICE_ACCOUNT_JSON = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
 GOOGLE_CALENDAR_ID = os.environ["GOOGLE_CALENDAR_ID"]
 
 NYC_COLLECTION_ID = os.environ.get("NYC_COLLECTION_ID", "63de598a71ebc00f98284aaf")
-NYC_CRUMB = os.environ["NYC_CRUMB"]  # must be set
+NYC_CRUMB = os.environ.get("NYC_CRUMB")  # OPTIONAL
 NYC_MONTHS_AHEAD = int(os.environ.get("NYC_MONTHS_AHEAD", "2"))
 
 NYC_BASE_URL = "https://www.nycforfree.co"
@@ -23,8 +27,13 @@ NYC_API_URL = f"{NYC_BASE_URL}/api/open/GetItemsByMonth"
 TIMEZONE = "America/New_York"
 IMPORT_MARKER = "Imported from nycforfree.co"
 
+# throttle a bit so we’re extra nice to Google
+INSERT_SLEEP_SECONDS = 0.1  # 10 writes/sec
 
-# --- GOOGLE CALENDAR SERVICE (SERVICE ACCOUNT) -------------------------------
+
+# ---------------------------------------------------------------------
+# GOOGLE CALENDAR SERVICE (SERVICE ACCOUNT)
+# ---------------------------------------------------------------------
 
 def get_calendar_service():
     info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
@@ -32,11 +41,12 @@ def get_calendar_service():
         info,
         scopes=["https://www.googleapis.com/auth/calendar"],
     )
-    service = build("calendar", "v3", credentials=creds)
-    return service
+    return build("calendar", "v3", credentials=creds)
 
 
-# --- NYC FOR FREE API --------------------------------------------------------
+# ---------------------------------------------------------------------
+# NYC FOR FREE API
+# ---------------------------------------------------------------------
 
 def month_iter(start_date: dt.date, months_ahead: int):
     """Yield (year, month) from the month of start_date forward."""
@@ -59,19 +69,17 @@ def fetch_month_items(year: int, month: int) -> List[Dict[str, Any]]:
     params = {
         "month": month_str,
         "collectionId": NYC_COLLECTION_ID,
-        "crumb": NYC_CRUMB,
     }
-    logging.info(f"Fetching items for {month_str}")
+    # crumb is optional
+    if NYC_CRUMB:
+        params["crumb"] = NYC_CRUMB
+
+    logging.info(f"Fetching items for {month_str} with params={params}")
     resp = requests.get(NYC_API_URL, params=params, timeout=20)
     resp.raise_for_status()
     data = resp.json()
 
-    # We don't know if it's "items" or "Items" etc, so try a few.
-    for key in ("items", "Items", "data", "Data"):
-        if isinstance(data, dict) and key in data and isinstance(data[key], list):
-            return data[key]
-
-    # Fallback: if the JSON itself is a list
+    # For this Squarespace endpoint, the top-level is a list of event objects.
     if isinstance(data, list):
         return data
 
@@ -82,7 +90,7 @@ def fetch_month_items(year: int, month: int) -> List[Dict[str, Any]]:
 def fetch_all_items() -> List[Dict[str, Any]]:
     """
     Fetch items for current month + NYC_MONTHS_AHEAD.
-    De-duplicate by some stable field if present.
+    De-duplicate by item['id'].
     """
     today = dt.date.today()
     all_items: List[Dict[str, Any]] = []
@@ -90,148 +98,144 @@ def fetch_all_items() -> List[Dict[str, Any]]:
     for year, month in month_iter(today.replace(day=1), NYC_MONTHS_AHEAD):
         all_items.extend(fetch_month_items(year, month))
 
-    # Deduplicate if items have some sort of id/slug
-    seen = set()
+    seen_ids = set()
     unique_items = []
     for item in all_items:
-        key = item.get("id") or item.get("_id") or item.get("slug") or json.dumps(
-            item, sort_keys=True
-        )
-        if key not in seen:
-            seen.add(key)
+        item_id = item.get("id")
+        if not item_id:
+            # as a fallback, dedupe by full JSON
+            item_id = json.dumps(item, sort_keys=True)
+        if item_id not in seen_ids:
+            seen_ids.add(item_id)
             unique_items.append(item)
 
     logging.info(f"Total unique items fetched: {len(unique_items)}")
     return unique_items
 
 
-# --- HELPER: INFER FIELDS FROM UNKNOWN JSON SHAPE ---------------------------
+# ---------------------------------------------------------------------
+# HELPERS FOR BUILDING EVENTS
+# ---------------------------------------------------------------------
 
-def _find_key(item: Dict[str, Any], substrings: List[str]) -> str | None:
+def ms_to_iso_date(ms: int) -> str:
     """
-    Return first key where all substrings appear in the lowercase key.
+    Squarespace gives startDate/endDate as ms since epoch.
+    We treat these as all-day events (date-only).
     """
-    lower_map = {k.lower(): k for k in item.keys()}
-    for lower_key, orig_key in lower_map.items():
-        if all(sub in lower_key for sub in substrings):
-            return orig_key
-    return None
+    # Use UTC here; for all-day events we only care about the calendar date
+    d = dt.datetime.utcfromtimestamp(ms / 1000.0).date()
+    return d.isoformat()
 
 
 def build_google_event_from_item(item: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Try to infer title, start, end, location, description from an arbitrary item.
-    You may want to print(item.keys()) once locally to tighten this mapping.
+    Map the Squarespace event JSON into a Google Calendar event.
+    Based on your sample, structure is like:
+
+    {
+      "id": "...",
+      "title": "...",
+      "location": {
+        "addressTitle": "...",
+        "addressLine1": "...",
+        "addressLine2": "...",
+        ...
+      },
+      "structuredContent": {
+        "_type": "CalendarEvent",
+        "startDate": 1764021600931,
+        "endDate": 1767585600931
+      },
+      "startDate": ... (duplicate),
+      "endDate": ...,
+      "fullUrl": "/events/...",
+      "excerpt": "...",
+      ...
+    }
     """
 
-    # title / summary
-    title_key = (
-        _find_key(item, ["title"])
-        or _find_key(item, ["name"])
-        or _find_key(item, ["summary"])
-    )
-    summary = str(item.get(title_key, "NYC for FREE event"))
+    # summary
+    summary = item.get("title") or "NYC for FREE event"
 
-    # location
-    location_key = (
-        _find_key(item, ["location"])
-        or _find_key(item, ["address"])
-        or _find_key(item, ["venue"])
-        or _find_key(item, ["place"])
-    )
-    location = str(item.get(location_key, "")) if location_key else ""
+    # location fields
+    location_obj = item.get("location") or {}
+    address_parts = []
+    for key in ("addressTitle", "addressLine1", "addressLine2", "addressCountry"):
+        val = location_obj.get(key)
+        if val:
+            address_parts.append(str(val))
+    location = ", ".join(address_parts)
 
-    # description-ish fields
+    # dates
+    sc = item.get("structuredContent") or {}
+    start_ms = sc.get("startDate") or item.get("startDate")
+    end_ms = sc.get("endDate") or item.get("endDate")
+
+    if start_ms is None:
+        raise ValueError(f"No start date in item: {item}")
+
+    start_date = ms_to_iso_date(int(start_ms))
+    if end_ms is not None:
+        end_date = ms_to_iso_date(int(end_ms))
+    else:
+        end_date = start_date
+
+    # all-day event representation
+    start_field = {"date": start_date, "timeZone": TIMEZONE}
+    end_field = {"date": end_date, "timeZone": TIMEZONE}
+
+    # description pieces
     description_parts = []
-    for key in ("description", "body", "excerpt", "details"):
-        k = _find_key(item, [key])
-        if k and item.get(k):
-            description_parts.append(str(item[k]))
 
-    # Sometimes there is a URL / link
-    url_key = _find_key(item, ["url"]) or _find_key(item, ["link"])
-    source_url = item.get(url_key)
+    excerpt = item.get("excerpt")
+    if excerpt:
+        description_parts.append(str(excerpt))
 
-    # start / end datetime-ish fields
-    # We look for something like startDate, start, begin, etc.
-    start_key = (
-        _find_key(item, ["start", "date"])
-        or _find_key(item, ["start"])
-        or _find_key(item, ["begin"])
-    )
-    end_key = (
-        _find_key(item, ["end", "date"])
-        or _find_key(item, ["end"])
-        or _find_key(item, ["finish"])
-    )
+    # tags
+    tags = item.get("tags") or []
+    if tags:
+        description_parts.append("Tags: " + ", ".join(tags))
 
-    start_raw = item.get(start_key) if start_key else None
-    end_raw = item.get(end_key) if end_key else None
+    # author
+    author = item.get("author") or {}
+    author_name = author.get("displayName") or (
+        (author.get("firstName") or "") + " " + (author.get("lastName") or "")
+    ).strip()
+    if author_name:
+        description_parts.append(f"Listed by: {author_name}")
 
-    if not start_raw:
-        raise ValueError(f"Cannot infer start time from item: {item}")
+    # link to the original event page
+    full_url = item.get("fullUrl")
+    source_url = None
+    if full_url:
+        # fullUrl is like "/events/slug"
+        source_url = NYC_BASE_URL.rstrip("/") + full_url
 
-    # Convert into Google Calendar datetime/date fields
-    start_field, end_field = _build_time_fields(start_raw, end_raw)
+    # base description text
+    desc = "\n\n".join(p for p in description_parts if p)
 
-    # Base event
+    # extra debugging + marker
+    extra = [IMPORT_MARKER]
+    if source_url:
+        extra.append(f"Source: {source_url}")
+    extra.append("Raw item JSON:\n" + json.dumps(item, indent=2))
+
+    full_desc = (desc + "\n\n" + "\n\n".join(extra)).strip()
+
     event = {
         "summary": summary,
         "location": location,
         "start": start_field,
         "end": end_field,
+        "description": full_desc,
     }
-
-    # Build description
-    desc = "\n\n".join([p for p in description_parts if p])
-    extra = [IMPORT_MARKER]
-    if source_url:
-        extra.append(f"Source: {source_url}")
-    # embed raw JSON for debugging if you want
-    extra.append("Raw item JSON:\n" + json.dumps(item, indent=2))
-    full_desc = (desc + "\n\n" + "\n\n".join(extra)).strip()
-    event["description"] = full_desc
 
     return event
 
 
-def _build_time_fields(start_raw: Any, end_raw: Any | None):
-    """
-    Map raw date/time strings into Google Calendar start/end dicts.
-    Handles all-day vs dateTime heuristically.
-    """
-
-    def parse_maybe_date(s: str) -> tuple[bool, str]:
-        s = s.strip()
-        # All-day date like '2025-11-24'
-        try:
-            if len(s) == 10:
-                dt.datetime.strptime(s, "%Y-%m-%d")
-                return True, s
-        except Exception:
-            pass
-        # Anything else: assume RFC3339-ish; let Calendar API validate
-        return False, s
-
-    start_is_date, start_val = parse_maybe_date(str(start_raw))
-    if end_raw:
-        end_is_date, end_val = parse_maybe_date(str(end_raw))
-    else:
-        end_is_date, end_val = start_is_date, start_val
-
-    if start_is_date and end_is_date:
-        # all-day event
-        start_field = {"date": start_val, "timeZone": TIMEZONE}
-        end_field = {"date": end_val, "timeZone": TIMEZONE}
-    else:
-        # timed event
-        start_field = {"dateTime": start_val, "timeZone": TIMEZONE}
-        end_field = {"dateTime": end_val, "timeZone": TIMEZONE}
-
-    return start_field, end_field
-
-
-# --- SYNC LOGIC -------------------------------------------------------------
+# ---------------------------------------------------------------------
+# SYNC LOGIC
+# ---------------------------------------------------------------------
 
 def delete_existing_imported_events(service):
     """
@@ -280,12 +284,19 @@ def insert_events(service, events: List[Dict[str, Any]]):
             body=e,
         ).execute()
         count += 1
+        # light throttling
+        time.sleep(INSERT_SLEEP_SECONDS)
     logging.info(f"Inserted {count} events.")
 
 
 def main():
     logging.basicConfig(level=logging.INFO)
     logging.info("Starting NYC for FREE calendar sync (service account mode)")
+
+    # jitter so we don’t always hit at the exact same second
+    delay = random.uniform(0, 300)  # up to 5 minutes
+    logging.info(f"Sleeping for {delay:.1f} seconds to add jitter…")
+    time.sleep(delay)
 
     service = get_calendar_service()
 
