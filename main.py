@@ -121,44 +121,18 @@ def fetch_all_items() -> List[Dict[str, Any]]:
 # HELPERS FOR BUILDING EVENTS
 # ---------------------------------------------------------------------
 
-def ms_to_iso_date(ms: int) -> str:
-    """
-    Squarespace gives startDate/endDate as ms since epoch.
-    We treat these as all-day events (date-only).
-    """
-    # Use UTC here; for all-day events we only care about the calendar date
-    d = dt.datetime.utcfromtimestamp(ms / 1000.0).date()
-    return d.isoformat()
+def ms_to_datetime(ms: int) -> dt.datetime:
+    """Convert milliseconds since epoch to a timezone-aware datetime in the local timezone."""
+    return dt.datetime.fromtimestamp(ms / 1000.0, tz=dt.timezone(dt.timedelta(hours=-5)))  # Default to EST/EDT
+
 
 
 def build_google_event_from_item(item: Dict[str, Any]) -> Dict[str, Any]:
     """
     Map the Squarespace event JSON into a Google Calendar event.
-    Based on your sample, structure is like:
-
-    {
-      "id": "...",
-      "title": "...",
-      "location": {
-        "addressTitle": "...",
-        "addressLine1": "...",
-        "addressLine2": "...",
-        ...
-      },
-      "structuredContent": {
-        "_type": "CalendarEvent",
-        "startDate": 1764021600931,
-        "endDate": 1767585600931
-      },
-      "startDate": ... (duplicate),
-      "endDate": ...,
-      "fullUrl": "/events/...",
-      "excerpt": "...",
-      ...
-    }
     """
-
     # summary
+    
     summary = item.get("title") or "NYC for FREE event"
 
     # location fields
@@ -178,63 +152,73 @@ def build_google_event_from_item(item: Dict[str, Any]) -> Dict[str, Any]:
     if start_ms is None:
         raise ValueError(f"No start date in item: {item}")
 
-    start_date = ms_to_iso_date(int(start_ms))
-    if end_ms is not None:
-        end_date = ms_to_iso_date(int(end_ms))
+    # Convert timestamps to datetime objects
+    start_dt = ms_to_datetime(int(start_ms))
+    end_dt = ms_to_datetime(int(end_ms)) if end_ms is not None else start_dt + dt.timedelta(hours=1)
+
+    # Check if it's an all-day event (time is midnight)
+    if start_dt.hour == 0 and start_dt.minute == 0 and (end_dt.hour == 0 or end_dt.hour == 23) and end_dt.minute == 0:
+        # All-day event
+        start_field = {"date": start_dt.date().isoformat(), "timeZone": TIMEZONE}
+        end_field = {"date": end_dt.date().isoformat(), "timeZone": TIMEZONE}
     else:
-        end_date = start_date
+        # Timed event
+        start_field = {"dateTime": start_dt.isoformat(), "timeZone": TIMEZONE}
+        end_field = {"dateTime": end_dt.isoformat(), "timeZone": TIMEZONE}
 
-    # all-day event representation
-    start_field = {"date": start_date, "timeZone": TIMEZONE}
-    end_field = {"date": end_date, "timeZone": TIMEZONE}
-
-    # description pieces
-    description_parts = []
-
-    excerpt = item.get("excerpt")
-    if excerpt:
-        description_parts.append(str(excerpt))
-
-    # tags
+    # Prepare description components
+    excerpt = str(item.get("excerpt", "")).strip()
+    
+    # Format tags if they exist
     tags = item.get("tags") or []
-    if tags:
-        description_parts.append("Tags: " + ", ".join(tags))
-
-    # author
+    tags_str = f"Tags: {', '.join(tags)}" if tags else ""
+    
+    # Format author information if available
     author = item.get("author") or {}
-    author_name = author.get("displayName") or (
-        (author.get("firstName") or "") + " " + (author.get("lastName") or "")
-    ).strip()
-    if author_name:
-        description_parts.append(f"Listed by: {author_name}")
-
-    # link to the original event page
+    author_name = (
+        author.get("displayName") or 
+        f"{author.get('firstName', '').strip()} {author.get('lastName', '').strip()}".strip()
+    )
+    author_str = f"Listed by: {author_name}" if author_name else ""
+    
+    # Prepare source URL
     full_url = item.get("fullUrl")
-    source_url = None
-    if full_url:
-        # fullUrl is like "/events/slug"
-        source_url = NYC_BASE_URL.rstrip("/") + full_url
+    source_url = f"{NYC_BASE_URL.rstrip('/')}{full_url}" if full_url else ""
+    
+    # Prepare debug info
+    debug_info = [
+        # IMPORT_MARKER,
+        # f"Source: {source_url}" if source_url else "",
+        "Raw item JSON:\n" + json.dumps(item, indent=2)
+    ]
+    debug_info_str = "\n\n".join(filter(None, debug_info))
 
-    # base description text
-    desc = "\n\n".join(p for p in description_parts if p)
+    # Format address if available
+    address_line1 = location_obj.get('addressLine1', '').strip()
+    address_line2 = location_obj.get('addressLine2', '').strip()
+    address = '\n'.join(line for line in [address_line1, address_line2] if line)
 
-    # extra debugging + marker
-    extra = [IMPORT_MARKER]
-    if source_url:
-        extra.append(f"Source: {source_url}")
-    extra.append("Raw item JSON:\n" + json.dumps(item, indent=2))
+    # Build the description using the template
+    description = f"""
+Full Information: {source_url}
+{excerpt + "\n" if excerpt else ""}
+Location: 
+{address_line1}
+{address_line2}
+    
+Tags: {tags_str}
+Listed by: {author_name}
 
-    full_desc = (desc + "\n\n" + "\n\n".join(extra)).strip()
+{debug_info_str}
+    """.strip()
 
-    event = {
+    return {
         "summary": summary,
         "location": location,
         "start": start_field,
         "end": end_field,
-        "description": full_desc,
+        "description": description,
     }
-
-    return event
 
 
 # ---------------------------------------------------------------------
