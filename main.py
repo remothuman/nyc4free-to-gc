@@ -10,9 +10,13 @@ import requests
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
+
 # ---------------------------------------------------------------------
 # CONFIG FROM ENV
 # ---------------------------------------------------------------------
+
+from dotenv import load_dotenv
+load_dotenv()
 
 GOOGLE_SERVICE_ACCOUNT_JSON = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
 GOOGLE_CALENDAR_ID = os.environ["GOOGLE_CALENDAR_ID"]
@@ -293,10 +297,10 @@ def main():
     logging.basicConfig(level=logging.INFO)
     logging.info("Starting NYC for FREE calendar sync (service account mode)")
 
-    # jitter so we don’t always hit at the exact same second
-    delay = random.uniform(0, 300)  # up to 5 minutes
-    logging.info(f"Sleeping for {delay:.1f} seconds to add jitter…")
-    time.sleep(delay)
+    # # jitter so we don’t always hit at the exact same second
+    # delay = random.uniform(0, 300)  # up to 5 minutes
+    # logging.info(f"Sleeping for {delay:.1f} seconds to add jitter…")
+    # time.sleep(delay)
 
     service = get_calendar_service()
 
