@@ -35,7 +35,7 @@ NYC_BASE_URL = "https://www.nycforfree.co"
 NYC_API_URL = f"{NYC_BASE_URL}/api/open/GetItemsByMonth"
 TIMEZONE = "America/New_York"
 # IMPORT_MARKER = "Imported from nycforfree.co"
-INSERT_DELAY = 0.1
+INSERT_DELAY = 0.01
 
 
 def get_calendar_service():
@@ -188,22 +188,30 @@ def build_google_event(item: Dict[str, Any]) -> Dict[str, Any]:
     description_parts = []
     
     if source_url:
-        description_parts.append(f"\nFull Information: {source_url}")
+        description_parts.append(f"Full Information: {source_url}")
+        description_parts.append("\n")
     if excerpt:
         description_parts.append(f"\n{excerpt}")
+        description_parts.append("\n")
     if address_line1 or address_line2:
-        description_parts.append("\nLocation:")
+        description_parts.append("\nAddress:")
         if address_line1:
             description_parts.append(f"\n{address_line1}")
         if address_line2:
             description_parts.append(f"\n{address_line2}")
+        
+        description_parts.append("\n")
+        
     if tags:
         description_parts.append(f"\nTags: {', '.join(str(t) for t in tags)}")
+
+        description_parts.append("\n")
     if author_name:
         description_parts.append(f"\nListed by: {author_name}")
     
-    description_parts.append(f"\n\nRaw item JSON:\n{json.dumps(item, indent=2)}")
-    description = "\n".join(description_parts)
+    # description_parts.append(f"\n\nRaw item JSON:\n{json.dumps(item, indent=2)}")
+
+    description = "".join(description_parts)
     
     return {
         "summary": title,

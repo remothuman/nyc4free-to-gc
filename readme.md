@@ -7,7 +7,9 @@ i used ai vibe-coding to help with making this.
 
 
 
+Todo next:
+- scrape the full event description and external link from the individual event pages to be able to embed that into the gcalendar
 
 Todo ideas:
-- multiple calendar, one with all day events as just first and last date, one normal
+- multiple calendar, one with all day events as just first and last date, one normal (or just do that for events longer than a month)
 - make a frontend landing webpage linking to how to add calendar
