@@ -2,9 +2,9 @@ import os
 import json
 import logging
 import datetime as dt
-import random
 import time
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Tuple
+import pytz
 
 import requests
 from google.oauth2 import service_account
@@ -30,6 +30,9 @@ NYC_API_URL = f"{NYC_BASE_URL}/api/open/GetItemsByMonth"
 
 TIMEZONE = "America/New_York"
 IMPORT_MARKER = "Imported from nycforfree.co"
+
+# Set to True to only delete events without re-adding them (for testing)
+DELETE_ONLY = False
 
 # throttle a bit so we’re extra nice to Google
 INSERT_SLEEP_SECONDS = 0.1  # 10 writes/sec
@@ -123,7 +126,8 @@ def fetch_all_items() -> List[Dict[str, Any]]:
 
 def ms_to_datetime(ms: int) -> dt.datetime:
     """Convert milliseconds since epoch to a timezone-aware datetime in the local timezone."""
-    return dt.datetime.fromtimestamp(ms / 1000.0, tz=dt.timezone(dt.timedelta(hours=-5)))  # Default to EST/EDT
+    tz = pytz.timezone(TIMEZONE)
+    return dt.datetime.fromtimestamp(ms / 1000.0, tz=tz)
 
 
 
@@ -152,19 +156,39 @@ def build_google_event_from_item(item: Dict[str, Any]) -> Dict[str, Any]:
     if start_ms is None:
         raise ValueError(f"No start date in item: {item}")
 
-    # Convert timestamps to datetime objects
-    start_dt = ms_to_datetime(int(start_ms))
-    end_dt = ms_to_datetime(int(end_ms)) if end_ms is not None else start_dt + dt.timedelta(hours=1)
+    try:
+        # Convert timestamps to datetime objects
+        start_dt = ms_to_datetime(int(start_ms))
+        end_dt = ms_to_datetime(int(end_ms)) if end_ms is not None else start_dt + dt.timedelta(hours=1)
 
-    # Check if it's an all-day event (time is midnight)
-    if start_dt.hour == 0 and start_dt.minute == 0 and (end_dt.hour == 0 or end_dt.hour == 23) and end_dt.minute == 0:
-        # All-day event
-        start_field = {"date": start_dt.date().isoformat(), "timeZone": TIMEZONE}
-        end_field = {"date": end_dt.date().isoformat(), "timeZone": TIMEZONE}
-    else:
-        # Timed event
-        start_field = {"dateTime": start_dt.isoformat(), "timeZone": TIMEZONE}
-        end_field = {"dateTime": end_dt.isoformat(), "timeZone": TIMEZONE}
+        # Check if it's an all-day event (spans full days or is exactly 24 hours)
+        is_all_day = (
+            (start_dt.hour == 0 and start_dt.minute == 0 and 
+             (end_dt.hour == 0 or end_dt.hour == 23) and 
+             end_dt.minute == 0) or
+            ((end_dt - start_dt) >= dt.timedelta(hours=23) and 
+             (end_dt - start_dt) <= dt.timedelta(hours=25))
+        )
+
+        if is_all_day:
+            # For all-day events, use just the date portion
+            start_date = start_dt.date()
+            end_date = end_dt.date()
+            
+            # If the event ends at midnight, it should be inclusive of the previous day
+            if end_dt.hour == 0 and end_dt.minute == 0:
+                end_date = (end_dt - dt.timedelta(days=1)).date()
+                
+            start_field = {"date": start_date.isoformat(), "timeZone": TIMEZONE}
+            end_field = {"date": (end_date + dt.timedelta(days=1)).isoformat(), "timeZone": TIMEZONE}  # Google's all-day events are exclusive of end date
+        else:
+            # For timed events, include full datetime with timezone
+            start_field = {"dateTime": start_dt.isoformat(), "timeZone": TIMEZONE}
+            end_field = {"dateTime": end_dt.isoformat(), "timeZone": TIMEZONE}
+            
+    except (ValueError, TypeError) as e:
+        logging.error(f"Error processing dates for event {item.get('id')}: {e}")
+        raise
 
     # Prepare description components
     excerpt = str(item.get("excerpt", "")).strip()
@@ -196,21 +220,37 @@ def build_google_event_from_item(item: Dict[str, Any]) -> Dict[str, Any]:
     # Format address if available
     address_line1 = location_obj.get('addressLine1', '').strip()
     address_line2 = location_obj.get('addressLine2', '').strip()
-    address = '\n'.join(line for line in [address_line1, address_line2] if line)
-
-    # Build the description using the template
-    description = f"""
-Full Information: {source_url}
-{excerpt + "\n" if excerpt else ""}
-Location: 
-{address_line1}
-{address_line2}
     
-Tags: {tags_str}
-Listed by: {author_name}
-
-{debug_info_str}
-    """.strip()
+    # Build the description using the template
+    description_parts = []
+    
+    # Add import marker if not in delete-only mode
+    if not DELETE_ONLY:
+        description_parts.append(IMPORT_MARKER)
+    
+    if source_url:
+        description_parts.append(f"Full Information: {source_url}")
+    
+    if excerpt:
+        description_parts.append(excerpt)
+    
+    if address_line1 or address_line2:
+        description_parts.append("Location:")
+        if address_line1:
+            description_parts.append(address_line1)
+        if address_line2:
+            description_parts.append(address_line2)
+    
+    if tags_str:
+        description_parts.append(tags_str)
+    
+    if author_name:
+        description_parts.append(f"Listed by: {author_name}")
+    
+    # Add debug info
+    description_parts.append(debug_info_str)
+    
+    description = "\n\n".join(filter(None, description_parts))
 
     return {
         "summary": summary,
@@ -227,53 +267,76 @@ Listed by: {author_name}
 
 def delete_existing_imported_events(service):
     """
-    Delete future events on the calendar that we previously imported
-    (we detect them via IMPORT_MARKER in the description).
+    Delete ALL events from the calendar (past and future).
     """
-    now = dt.datetime.utcnow().isoformat() + "Z"
-
     page_token = None
     deleted = 0
+    failed = 0
 
     while True:
-        events_result = (
-            service.events()
-            .list(
-                calendarId=GOOGLE_CALENDAR_ID,
-                timeMin=now,
-                singleEvents=True,
-                orderBy="startTime",
-                pageToken=page_token,
-            )
-            .execute()
-        )
-        items = events_result.get("items", [])
-        for ev in items:
-            desc = (ev.get("description") or "").lower()
-            if IMPORT_MARKER.lower() in desc:
-                service.events().delete(
+        try:
+            events_result = (
+                service.events()
+                .list(
                     calendarId=GOOGLE_CALENDAR_ID,
-                    eventId=ev["id"],
-                ).execute()
-                deleted += 1
+                    singleEvents=True,
+                    orderBy="startTime",
+                    pageToken=page_token,
+                )
+                .execute()
+            )
+            items = events_result.get("items", [])
+            
+            if not items:
+                # No more events in this page
+                page_token = events_result.get("nextPageToken")
+                if not page_token:
+                    break
+                continue
+                
+            for ev in items:
+                try:
+                    service.events().delete(
+                        calendarId=GOOGLE_CALENDAR_ID,
+                        eventId=ev["id"],
+                    ).execute()
+                    deleted += 1
+                    logging.debug(f"Deleted event: {ev.get('summary', 'Untitled')} ({ev['id']})")
+                except Exception as e:
+                    failed += 1
+                    logging.error(f"Error deleting event {ev.get('id')}: {str(e)}")
 
-        page_token = events_result.get("nextPageToken")
-        if not page_token:
+            page_token = events_result.get("nextPageToken")
+            if not page_token:
+                break
+                
+        except Exception as e:
+            logging.error(f"Error fetching events page: {str(e)}")
             break
 
-    logging.info(f"Deleted {deleted} previously-imported events.")
+    logging.info(f"Deleted {deleted} existing events from the calendar.")
+    if failed > 0:
+        logging.warning(f"Failed to delete {failed} events.")
 
 
 def insert_events(service, events: List[Dict[str, Any]]):
+    if not events:
+        logging.info("No events to insert.")
+        return
+    
     count = 0
     for e in events:
-        service.events().insert(
-            calendarId=GOOGLE_CALENDAR_ID,
-            body=e,
-        ).execute()
-        count += 1
-        # light throttling
-        time.sleep(INSERT_SLEEP_SECONDS)
+        try:
+            service.events().insert(
+                calendarId=GOOGLE_CALENDAR_ID,
+                body=e,
+            ).execute()
+            count += 1
+            # light throttling
+            time.sleep(INSERT_SLEEP_SECONDS)
+        except Exception as ex:
+            logging.error(f"Error inserting event: {str(ex)}")
+            logging.error(f"Event data: {json.dumps(e, indent=2)}")
     logging.info(f"Inserted {count} events.")
 
 
@@ -281,26 +344,30 @@ def main():
     logging.basicConfig(level=logging.INFO)
     logging.info("Starting NYC for FREE calendar sync (service account mode)")
 
-    # # jitter so we don’t always hit at the exact same second
-    # delay = random.uniform(0, 300)  # up to 5 minutes
-    # logging.info(f"Sleeping for {delay:.1f} seconds to add jitter…")
-    # time.sleep(delay)
-
     service = get_calendar_service()
 
-    logging.info("Deleting previously-imported future events…")
+    logging.info("Deleting all events from calendar…")
     delete_existing_imported_events(service)
+    
+    if DELETE_ONLY:
+        logging.info("DELETE_ONLY mode is enabled - exiting without adding new events")
+        return
 
     logging.info("Fetching events from NYC for FREE API…")
     items = fetch_all_items()
 
     logging.info("Building Google Calendar events…")
     events = []
+    failed_builds = 0
     for item in items:
         try:
             events.append(build_google_event_from_item(item))
         except Exception as e:
-            logging.warning(f"Skipping item due to error {e}: {item}")
+            failed_builds += 1
+            logging.error(f"Error building event from item {item.get('id', 'unknown')}: {e}")
+    
+    if failed_builds > 0:
+        logging.warning(f"Failed to build {failed_builds} events.")
 
     logging.info("Inserting events into Google Calendar…")
     insert_events(service, events)
