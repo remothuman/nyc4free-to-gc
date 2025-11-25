@@ -39,6 +39,9 @@ TIMEZONE = "America/New_York"
 # IMPORT_MARKER = "Imported from nycforfree.co"
 INSERT_DELAY = 0.01
 SCRAPED_DESCRIPTION_FIELD = "_scraped_description"
+OFFICIAL_URL_FIELD = "_official_url"
+OFFICIAL_LABEL_FIELD = "_official_label"
+POSTER_IMAGE_FIELD = "_poster_image_url"
 
 
 def get_calendar_service():
@@ -186,6 +189,9 @@ def build_google_event(item: Dict[str, Any]) -> Dict[str, Any]:
     full_url = item.get("fullUrl", "")
     source_url = f"{NYC_BASE_URL.rstrip('/')}{full_url}" if full_url else ""
     
+    official_url = item.get(OFFICIAL_URL_FIELD, "").strip()
+    official_label = item.get(OFFICIAL_LABEL_FIELD, "").strip() or "Official Link"
+    poster_image_url = item.get(POSTER_IMAGE_FIELD, "").strip()
     address_line1 = location_obj.get("addressLine1", "").strip()
     address_line2 = location_obj.get("addressLine2", "").strip()
     
@@ -195,6 +201,11 @@ def build_google_event(item: Dict[str, Any]) -> Dict[str, Any]:
         description_parts.append(f"Full Information: {source_url}")
         description_parts.append("\n")
     details_text = scraped_description or excerpt
+    
+    if poster_image_url:
+        description_parts.append(f"(Has a poster image)")
+        description_parts.append(f"\nPoster: {poster_image_url}")
+        description_parts.append("\n")
     
     if address_line1 or address_line2:
         description_parts.append("\nLocation:")
@@ -209,14 +220,17 @@ def build_google_event(item: Dict[str, Any]) -> Dict[str, Any]:
         description_parts.append("\nAbout:\n")
         description_parts.append(details_text)
         description_parts.append("\n")
-    
         
+    if official_url:
+        description_parts.append(f"\n{official_label}: {official_url}")
+        description_parts.append("\n")
+    
     if tags:
         description_parts.append(f"\nTags: {', '.join(str(t) for t in tags)}")
 
         description_parts.append("\n")
     if author_name:
-        description_parts.append(f"\nListed by: {author_name}")
+        description_parts.append(f"\n\nListed by: {author_name}")
     
     # description_parts.append(f"\n\nRaw item JSON:\n{json.dumps(item, indent=2)}")
 
@@ -232,35 +246,59 @@ def build_google_event(item: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def delete_all_events(service, calendar_id: str) -> int:
-    """Delete all events from calendar."""
+    """Delete all events from calendar using batch requests for speed."""
     deleted = 0
     page_token = None
     
     logger.info("Deleting all existing events...")
     
+    # First, collect all event IDs
+    event_ids = []
     while True:
         try:
             result = service.events().list(
                 calendarId=calendar_id,
                 singleEvents=True,
                 pageToken=page_token,
-                maxResults=250,
+                maxResults=2500,
+                fields="items(id),nextPageToken",  # Only fetch what we need
             ).execute()
             
-            for event in result.get("items", []):
-                service.events().delete(
-                    calendarId=calendar_id,
-                    eventId=event["id"],
-                ).execute()
-                deleted += 1
+            event_ids.extend(event["id"] for event in result.get("items", []))
             
             page_token = result.get("nextPageToken")
             if not page_token:
                 break
                 
         except Exception as e:
-            logger.error(f"Error deleting events: {e}")
+            logger.error(f"Error listing events: {e}")
             raise
+    
+    if not event_ids:
+        logger.info("No events to delete")
+        return 0
+    
+    logger.info(f"Found {len(event_ids)} events to delete, batching requests...")
+    
+    # Delete in batches of 50 (Google API limit)
+    BATCH_SIZE = 50
+    
+    for i in range(0, len(event_ids), BATCH_SIZE):
+        batch = service.new_batch_http_request()
+        batch_ids = event_ids[i:i + BATCH_SIZE]
+        
+        for event_id in batch_ids:
+            batch.add(
+                service.events().delete(calendarId=calendar_id, eventId=event_id)
+            )
+        
+        try:
+            batch.execute()
+            deleted += len(batch_ids)
+            logger.info(f"Deleted batch {i // BATCH_SIZE + 1} ({deleted}/{len(event_ids)} events)")
+        except Exception as e:
+            logger.error(f"Error in batch delete: {e}")
+            # Continue with next batch even if one fails
     
     logger.info(f"Deleted {deleted} events")
     return deleted
@@ -312,9 +350,16 @@ def main():
                 # Scrape description for this event
                 url = event.get("fullUrl")
                 if url:
-                    description = scraper.get_description(url)
-                    if description:
-                        event[SCRAPED_DESCRIPTION_FIELD] = description
+                    details = scraper.get_details(url)
+                    if details.description:
+                        event[SCRAPED_DESCRIPTION_FIELD] = details.description
+                    if details.external_url:
+                        event[OFFICIAL_URL_FIELD] = details.external_url
+                        event[OFFICIAL_LABEL_FIELD] = (
+                            details.external_label or "Official Link"
+                        )
+                    if details.poster_image_url:
+                        event[POSTER_IMAGE_FIELD] = details.poster_image_url
                 
                 # Convert to Google Calendar format
                 google_event = build_google_event(event)
