@@ -4,16 +4,18 @@ NYC for Free Calendar Sync - Simple functional version
 
 import json
 import logging
+import os
 import time
-from datetime import datetime, date, timedelta
-from typing import List, Dict, Any, Optional
+from datetime import date, datetime, timedelta
+from typing import Any, Dict, List, Optional
 
 import pytz
 import requests
+from dotenv import load_dotenv
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
-from dotenv import load_dotenv
-import os
+
+from description_scraper import EventDescriptionScraper
 
 logging.basicConfig(
     level=logging.INFO,
@@ -36,6 +38,7 @@ NYC_API_URL = f"{NYC_BASE_URL}/api/open/GetItemsByMonth"
 TIMEZONE = "America/New_York"
 # IMPORT_MARKER = "Imported from nycforfree.co"
 INSERT_DELAY = 0.01
+SCRAPED_DESCRIPTION_FIELD = "_scraped_description"
 
 
 def get_calendar_service():
@@ -173,6 +176,7 @@ def build_google_event(item: Dict[str, Any]) -> Dict[str, Any]:
         end_field = {"dateTime": end_dt.isoformat(), "timeZone": TIMEZONE}
     
     # Build description
+    scraped_description = item.get(SCRAPED_DESCRIPTION_FIELD, "").strip()
     excerpt = item.get("excerpt", "").strip()
     tags = item.get("tags") or []
     author = item.get("author") or {}
@@ -190,9 +194,8 @@ def build_google_event(item: Dict[str, Any]) -> Dict[str, Any]:
     if source_url:
         description_parts.append(f"Full Information: {source_url}")
         description_parts.append("\n")
-    if excerpt:
-        description_parts.append(f"\n{excerpt}")
-        description_parts.append("\n")
+    details_text = scraped_description or excerpt
+    
     if address_line1 or address_line2:
         description_parts.append("\nLocation:")
         if address_line1:
@@ -201,6 +204,12 @@ def build_google_event(item: Dict[str, Any]) -> Dict[str, Any]:
             description_parts.append(f"\n{address_line2}")
         
         description_parts.append("\n")
+    
+    if details_text:
+        description_parts.append("\nAbout:\n")
+        description_parts.append(details_text)
+        description_parts.append("\n")
+    
         
     if tags:
         description_parts.append(f"\nTags: {', '.join(str(t) for t in tags)}")
@@ -284,8 +293,9 @@ def main():
     logger.info("Starting NYC for Free calendar sync")
     
     try:
-        # Initialize Google Calendar service
+        # Initialize services
         service = get_calendar_service()
+        scraper = EventDescriptionScraper(base_url=NYC_BASE_URL)
         
         # Delete existing events
         delete_all_events(service, GOOGLE_CALENDAR_ID)
@@ -293,18 +303,38 @@ def main():
         # Fetch events from NYC for Free
         nyc_events = fetch_all_events()
         
-        # Convert to Google Calendar format
-        google_events = []
-        for event in nyc_events:
+        # Process and insert events one at a time
+        logger.info(f"Processing and inserting {len(nyc_events)} events...")
+        inserted = 0
+        
+        for i, event in enumerate(nyc_events, 1):
             try:
-                google_events.append(build_google_event(event))
+                # Scrape description for this event
+                url = event.get("fullUrl")
+                if url:
+                    description = scraper.get_description(url)
+                    if description:
+                        event[SCRAPED_DESCRIPTION_FIELD] = description
+                
+                # Convert to Google Calendar format
+                google_event = build_google_event(event)
+                
+                # Insert immediately
+                service.events().insert(
+                    calendarId=GOOGLE_CALENDAR_ID,
+                    body=google_event,
+                ).execute()
+                inserted += 1
+                
+                if i % 10 == 0:
+                    logger.info(f"Processed {i}/{len(nyc_events)} events")
+                
+                time.sleep(INSERT_DELAY)
+                
             except Exception as e:
-                logger.warning(f"Skipping event {event.get('id')}: {e}")
+                logger.warning(f"Failed to process event {event.get('id')}: {e}")
         
-        # Insert into calendar
-        insert_events(service, GOOGLE_CALENDAR_ID, google_events)
-        
-        logger.info("Sync completed successfully")
+        logger.info(f"Sync completed successfully. Inserted {inserted}/{len(nyc_events)} events")
         return 0
         
     except Exception as e:
