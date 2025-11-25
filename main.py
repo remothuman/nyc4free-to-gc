@@ -198,14 +198,17 @@ def build_google_event(item: Dict[str, Any]) -> Dict[str, Any]:
     description_parts = []
     
     if source_url:
-        description_parts.append(f"Full Information: {source_url}")
+        if poster_image_url:
+            description_parts.append(f"Full Information: (has poster): {source_url}")
+        else:
+            description_parts.append(f"Full Information: {source_url}")
         description_parts.append("\n")
     details_text = scraped_description or excerpt
     
-    if poster_image_url:
-        description_parts.append(f"(Has a poster image)")
-        description_parts.append(f"\nPoster: {poster_image_url}")
-        description_parts.append("\n")
+    # if poster_image_url:
+    #     # description_parts.append(f"(has poster image)")
+    #     # description_parts.append(f"\nPoster: {poster_image_url}")
+    #     description_parts.append("\n")
     
     if address_line1 or address_line2:
         description_parts.append("\nLocation:")
