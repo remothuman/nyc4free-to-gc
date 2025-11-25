@@ -12,4 +12,6 @@ Todo next:
 
 Todo ideas:
 - multiple calendar, one with all day events as just first and last date, one normal (or just do that for events longer than a month)
-- make a frontend landing webpage linking to how to add calendar
+    - &/or multiple calendars for event types if possible 
+- make a frontend landing webpage linking to how to add calendar 
+(make personal website page with this, luma, and other sources)

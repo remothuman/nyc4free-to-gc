@@ -29,7 +29,7 @@ GOOGLE_SERVICE_ACCOUNT_JSON = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
 GOOGLE_CALENDAR_ID = os.environ["GOOGLE_CALENDAR_ID"]
 NYC_COLLECTION_ID = os.getenv("NYC_COLLECTION_ID", "63de598a71ebc00f98284aaf")
 NYC_CRUMB = os.getenv("NYC_CRUMB")
-MONTHS_AHEAD = int(os.getenv("NYC_MONTHS_AHEAD", "2"))
+MONTHS_AHEAD = int(os.getenv("NYC_MONTHS_AHEAD", "4"))
 
 NYC_BASE_URL = "https://www.nycforfree.co"
 NYC_API_URL = f"{NYC_BASE_URL}/api/open/GetItemsByMonth"
@@ -194,7 +194,7 @@ def build_google_event(item: Dict[str, Any]) -> Dict[str, Any]:
         description_parts.append(f"\n{excerpt}")
         description_parts.append("\n")
     if address_line1 or address_line2:
-        description_parts.append("\nAddress:")
+        description_parts.append("\nLocation:")
         if address_line1:
             description_parts.append(f"\n{address_line1}")
         if address_line2:
