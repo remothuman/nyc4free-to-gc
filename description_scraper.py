@@ -166,6 +166,7 @@ def _create_html2text_converter() -> html2text.HTML2Text:
     h.ignore_emphasis = True
     h.body_width = 0  # Don't wrap lines
     h.ul_item_mark = "-"  # Use dash for bullet points
+    h.single_line_break = True  # Use single newlines instead of double
     return h
 
 

@@ -199,7 +199,7 @@ def build_google_event(item: Dict[str, Any]) -> Dict[str, Any]:
     
     if source_url:
         if poster_image_url:
-            description_parts.append(f"Full Information: (has poster): {source_url}")
+            description_parts.append(f"Full Information (has poster): {source_url}")
         else:
             description_parts.append(f"Full Information: {source_url}")
         description_parts.append("\n")
@@ -228,12 +228,13 @@ def build_google_event(item: Dict[str, Any]) -> Dict[str, Any]:
         description_parts.append(f"\n{official_label}: {official_url}")
         description_parts.append("\n")
     
+    if details_text:
+        description_parts.append("\n---")
+    
     if tags:
         description_parts.append(f"\nTags: {', '.join(str(t) for t in tags)}")
-
-        description_parts.append("\n")
     if author_name:
-        description_parts.append(f"\n\nListed by: {author_name}")
+        description_parts.append(f"\nListed by: {author_name}")
     
     # description_parts.append(f"\n\nRaw item JSON:\n{json.dumps(item, indent=2)}")
 
@@ -248,12 +249,18 @@ def build_google_event(item: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def delete_all_events(service, calendar_id: str) -> int:
-    """Delete all events from calendar using batch requests for speed."""
+def delete_future_events(service, calendar_id: str) -> int:
+    """Delete events from current month onwards using batch requests for speed."""
     deleted = 0
     page_token = None
     
-    logger.info("Deleting all existing events...")
+    # Calculate start of current month
+    tz = pytz.timezone(TIMEZONE)
+    today = datetime.now(tz)
+    start_of_month = today.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    time_min = start_of_month.isoformat()
+    
+    logger.info(f"Deleting events from {start_of_month.strftime('%Y-%m-%d')} onwards...")
     
     # First, collect all event IDs
     event_ids = []
@@ -264,6 +271,7 @@ def delete_all_events(service, calendar_id: str) -> int:
                 singleEvents=True,
                 pageToken=page_token,
                 maxResults=2500,
+                timeMin=time_min,  # Only events from current month onwards
                 fields="items(id),nextPageToken",  # Only fetch what we need
             ).execute()
             
@@ -339,7 +347,7 @@ def main():
         scraper = EventDescriptionScraper(base_url=NYC_BASE_URL)
         
         # Delete existing events
-        delete_all_events(service, GOOGLE_CALENDAR_ID)
+        delete_future_events(service, GOOGLE_CALENDAR_ID)
         
         # Fetch events from NYC for Free
         nyc_events = fetch_all_events()
